@@ -63,6 +63,9 @@
           <button class="nav-link" onclick="switchTab('integrations')">
             <i data-lucide="link-2"></i> Integrations
           </button>
+          <button class="nav-link" onclick="switchTab('agents')">
+            <i data-lucide="workflow"></i> Agents
+          </button>
           <button class="nav-link" onclick="switchTab('settings')">
             <i data-lucide="settings"></i> Settings
           </button>
@@ -111,6 +114,10 @@
       <button class="mobile-tab-btn" onclick="switchTab('integrations')">
         <i data-lucide="link-2"></i>
         <span>Link</span>
+      </button>
+      <button class="mobile-tab-btn" onclick="switchTab('agents')">
+        <i data-lucide="workflow"></i>
+        <span>Agents</span>
       </button>
     </nav>
 
@@ -498,7 +505,28 @@
           </div>
         </section>
 
-        <!-- 8. SETTINGS TAB -->
+        <!-- 8. AGENTS / WORKFLOWS TAB -->
+        <section id="panel-agents" class="panel">
+          <h1 class="page-title">Agents & Workflows</h1>
+          <p style="color: var(--text-secondary); margin-bottom: 2rem; font-size: 0.95rem;">
+            Install ready-made automations, create new agents or workflows, and inspect recent runs from Lemma.
+          </p>
+
+          <span class="category-label">Templates</span>
+          <div id="agent-template-list" class="automation-grid"></div>
+
+          <hr class="section-divider">
+
+          <span class="category-label">Create New</span>
+          <div id="agent-create-flow" class="paper-surface automation-create-flow"></div>
+
+          <hr class="section-divider">
+
+          <span class="category-label">Installed Agents & Workflows</span>
+          <div id="agent-workflow-list" class="automation-list"></div>
+        </section>
+
+        <!-- 9. SETTINGS TAB -->
         <section id="panel-settings" class="panel">
           <h1 class="page-title">Settings</h1>
           <p style="color: var(--text-secondary); margin-bottom: 2rem; font-size: 0.95rem;">
