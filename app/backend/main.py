@@ -45,6 +45,37 @@ def _to_plain(value: Any) -> Any:
     return value
 
 
+def _item_out(item: Any) -> Dict[str, Any]:
+    """Serialize a pod_store.Rec item into the shape the frontend expects."""
+    return {
+        "id": str(item.id),
+        "type": item.type,
+        "title": item.title,
+        "content": item.content,
+        "status": item.status or "todo",
+        "priority": item.priority,
+        "due_date": item.due_date,
+        "category": item.category,
+        "metadata_json": item.metadata_json or {},
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    }
+
+
+def _review_out(rev: Any) -> Dict[str, Any]:
+    """Serialize a study-review Rec for the Today / Learning views."""
+    return {
+        "id": str(rev.id),
+        "concept_id": rev.concept_id,
+        "concept_title": rev.concept_title,
+        "concept_content": (rev.metadata_json or {}).get("concept_content", ""),
+        "interval_days": rev.interval_days,
+        "due_date": rev.due_date,
+        "last_reviewed_at": rev.last_reviewed_at,
+        "status": rev.status,
+    }
+
+
 def _sdk_error_message(exc: Exception) -> str:
     detail = getattr(exc, "message", None) or str(exc)
     status_code = getattr(exc, "status_code", None)
@@ -710,15 +741,15 @@ async def get_today_view(
     }
         
     return {
-        "overdue_tasks": overdue,
-        "due_today_tasks": due_today,
+        "overdue_tasks": [_item_out(t) for t in overdue],
+        "due_today_tasks": [_item_out(t) for t in due_today],
         "stale_followups": {
             "count": len(stale_followups),
-            "items": stale_followups
+            "items": [_item_out(t) for t in stale_followups]
         },
         "due_reviews": {
             "count": len(due_reviews),
-            "items": due_reviews
+            "items": [_review_out(r) for r in due_reviews]
         },
         "insight_card": insight_card
     }
@@ -727,6 +758,7 @@ async def get_today_view(
 
 @app.get("/api/integrations")
 async def list_integrations(
+    db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
     try:
@@ -765,7 +797,29 @@ async def list_integrations(
             error_message=None,
             last_sync_at=None
         ))
-    return response
+
+    # Email (Gmail IMAP/SMTP) is configured in Settings, not via a Lemma connector.
+    # Surface it here so it shows as a first-class integration.
+    try:
+        settings = await settings_service.get_resolved_settings(db, current_user.id)
+    except Exception:
+        settings = {}
+    email_configured = bool(settings.get("email_address") and settings.get("email_app_password"))
+    email_entry = schemas.UserIntegrationResponse(
+        name="email",
+        is_connected=email_configured,
+        scopes=["mail.read", "mail.send"],
+        metadata_json={
+            "display_name": "Email (Gmail)",
+            "description": "Read and send email over IMAP/SMTP. Configure in Settings with a Google App Password.",
+            "account": {"email": settings.get("email_address")} if email_configured else {},
+            "settings_managed": True,
+        },
+        health_status="healthy" if email_configured else "unconfigured",
+        error_message=None,
+        last_sync_at=None,
+    )
+    return [email_entry] + response
 
 @app.get("/api/integrations/{name}/auth-url")
 async def get_integration_auth_url(
@@ -786,22 +840,26 @@ async def get_integration_auth_url(
         raise HTTPException(status_code=500, detail=f"Lemma connector failed: {_sdk_error_message(e)}")
 
 @app.get("/api/integrations/oauth/callback", response_class=HTMLResponse)
-async def oauth_callback(
-    code: str,
-    state: str,
-    db: AsyncSession = Depends(get_db)
-):
-    try:
-        auth_url = await connectors_service.get_connect_url(name)
-        return {"auth_url": auth_url}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+async def oauth_callback(code: str = "", state: str = ""):
+    # Composio/Lemma completes the OAuth exchange server-side; this page is the
+    # browser redirect target. It just confirms and closes the popup.
+    return HTMLResponse(
+        "<html><body style='font-family:sans-serif;text-align:center;padding-top:3rem'>"
+        "<h2>Connected ✓</h2><p>You can close this window and return to LifeOS.</p>"
+        "<script>setTimeout(function(){window.close();},1200);</script>"
+        "</body></html>"
+    )
 
 @app.delete("/api/integrations/{name}")
 async def disconnect_integration(
     name: str,
+    db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
+    if name == "email":
+        await crud.upsert_setting(db, current_user.id, "email_app_password", encrypt_data(""), is_secret=True)
+        await db.commit()
+        return {"detail": "Email disconnected. Re-add your app password in Settings to reconnect."}
     normalized_name = name.replace("-", "_")
     try:
         from .sdk_client import get_lemma_pod
@@ -826,8 +884,13 @@ async def disconnect_integration(
 @app.post("/api/integrations/{name}/test")
 async def test_integration_connection(
     name: str,
+    db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
+    if name == "email":
+        settings = await settings_service.get_resolved_settings(db, current_user.id)
+        ok = await email_adapter.test_email(settings)
+        return {"status": "healthy"} if ok else {"status": "unhealthy", "error_message": "IMAP/SMTP login failed. Check your app password in Settings."}
     connected = await connectors_service.is_connected(name)
     if not connected:
         return {"status": "unhealthy", "error_message": "Not connected yet."}
@@ -1044,44 +1107,98 @@ async def send_chat_message(
 
 # -- Lemma Agents / Workflows --
 
+# Each template is a self-contained, runnable agent: rich instruction + POD toolset
+# so it can actually read your tasks/notes the moment it is installed and run.
 TEMPLATES: Dict[str, Dict[str, Any]] = {
-    "daily-briefing": {
-        "name": "Daily Briefing Agent",
+    "daily-digest": {
+        "name": "Daily Digest",
         "type": "agent",
-        "description": "Runs every morning. Summarizes your open tasks, emails, and deadlines into a single brief.",
-        "trigger": "Daily at 8:00 AM",
-        "schedule": {"agent_name": "daily-briefing", "schedule_type": "time", "cron": "0 8 * * *", "name": "daily-briefing"},
+        "agent_name": "daily-digest",
+        "description": "Every morning, summarizes your overdue, due-today, and waiting-on items into a short brief with a suggested focus for the day.",
+        "trigger": "Daily at 7:00 AM",
+        "toolsets": ["POD"],
+        "instruction": (
+            "You are a personal chief-of-staff. Read the user's tasks from the `items` table. "
+            "Produce a short morning brief: (1) what is overdue, (2) what is due today, "
+            "(3) anything they are waiting on someone for, and (4) one sentence recommending "
+            "the single most important thing to focus on today. Be concise and encouraging."
+        ),
+        "schedule": {"agent_name": "daily-digest", "schedule_type": "time", "cron": "0 7 * * *", "name": "daily-digest"},
     },
-    "followup-nudger": {
-        "name": "Follow-up Nudger Workflow",
-        "type": "workflow",
-        "description": "Checks tasks marked waiting on someone and sends a nudge after more than 3 days.",
-        "trigger": "Daily at 9:00 AM",
-        "schedule": {"workflow_name": "followup-nudger", "schedule_type": "time", "cron": "0 9 * * *", "name": "followup-nudger"},
-    },
-    "weekly-review": {
-        "name": "Weekly Review Workflow",
-        "type": "workflow",
-        "description": "Every Sunday, summarizes closed tasks, missed deadlines, and next week's attention points.",
-        "trigger": "Weekly Sunday at 10:00 AM",
-        "schedule": {"workflow_name": "weekly-review", "schedule_type": "time", "cron": "0 10 * * 0", "name": "weekly-review"},
-    },
-    "note-to-task": {
-        "name": "Note-to-Task Agent",
+    "task-prioritizer": {
+        "name": "Task Prioritizer",
         "type": "agent",
-        "description": "Watches new Second Brain notes and creates tasks when a note sounds actionable.",
-        "trigger": "Notes table insert",
-        "schedule": {"agent_name": "note-to-task", "schedule_type": "datastore", "table_name": "notes", "event": "insert", "name": "note-to-task"},
-    },
-    "study-debrief": {
-        "name": "Study Session Debrief Agent",
-        "type": "agent",
-        "description": "After a study session, asks what you covered, updates strengths, and schedules review.",
-        "trigger": "Manual from Learning",
+        "agent_name": "task-prioritizer",
+        "description": "On demand, reviews every open task and recommends a ranked focus order with a one-line reason for each — balancing urgency, due dates, and priority.",
+        "trigger": "Manual — run any time",
+        "toolsets": ["POD"],
+        "instruction": (
+            "You are a productivity coach. Read all open (status != done) tasks and deadlines from "
+            "the `items` table. Rank them into a focus order for today. For each, give a one-line "
+            "reason weighing due date, stated priority, and how long it's been waiting. End with a "
+            "short 'what to say no to' note if there are too many high-priority items."
+        ),
         "schedule": None,
-        "agent_name": "study-debrief",
+    },
+    "note-summarizer": {
+        "name": "Note Summarizer",
+        "type": "agent",
+        "agent_name": "note-summarizer",
+        "description": "Reads your recent Second Brain notes, distills the key themes, and pulls out any hidden action items you never turned into tasks.",
+        "trigger": "Manual — run any time",
+        "toolsets": ["POD"],
+        "instruction": (
+            "You are a knowledge assistant. Read the user's recent notes (type == 'note') from the "
+            "`items` table. Produce: (1) a 3-5 bullet summary of the main themes, and (2) a list of "
+            "concrete action items implied by the notes that are not yet tasks. Reference note titles."
+        ),
+        "schedule": None,
+    },
+    "weekly-planner": {
+        "name": "Weekly Planner",
+        "type": "agent",
+        "agent_name": "weekly-planner",
+        "description": "Every Sunday, reviews what slipped last week and drafts a realistic plan for the week ahead based on your open commitments.",
+        "trigger": "Weekly on Sunday at 6:00 PM",
+        "toolsets": ["POD"],
+        "instruction": (
+            "You are a weekly planning partner. Read all tasks and deadlines from the `items` table. "
+            "Summarize what was completed and what slipped past its due date. Then propose a realistic "
+            "plan for the coming week, grouping the open commitments across the days and flagging any "
+            "week where too much is due at once."
+        ),
+        "schedule": {"agent_name": "weekly-planner", "schedule_type": "time", "cron": "0 18 * * 0", "name": "weekly-planner"},
+    },
+    "inbox-triage": {
+        "name": "Inbox Triage",
+        "type": "agent",
+        "agent_name": "inbox-triage",
+        "description": "Scans unread email and sorts it into Urgent / Needs a reply / Can wait, each with a one-line reason. Requires the Gmail integration.",
+        "trigger": "Manual — requires Gmail",
+        "toolsets": ["POD", "WEB_SEARCH"],
+        "instruction": (
+            "You are an executive assistant triaging email. Categorize the user's unread messages into "
+            "'Urgent', 'Needs a reply', and 'Can wait', each with a one-line reason. If you cannot "
+            "access mail, say clearly that the Gmail integration must be connected first."
+        ),
+        "schedule": None,
     },
 }
+
+
+def _pod_grants(write: bool = False, connectors: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Least-privilege datastore (and optional connector) grants for an agent."""
+    record_perms = ["datastore.table.read", "datastore.record.read"]
+    if write:
+        record_perms.append("datastore.record.write")
+    grants = [
+        {"resource_type": "datastore_table", "resource_name": "items", "permission_ids": record_perms},
+        {"resource_type": "datastore_table", "resource_name": "connections", "permission_ids": ["datastore.table.read", "datastore.record.read"]},
+        {"resource_type": "datastore_table", "resource_name": "study_reviews", "permission_ids": ["datastore.table.read", "datastore.record.read"]},
+    ]
+    for conn in connectors or []:
+        grants.append({"resource_type": "connector", "resource_name": conn, "permission_ids": ["connector.use"]})
+    return {"grants": grants}
 
 
 def _slugify_name(value: str) -> str:
@@ -1101,10 +1218,12 @@ async def list_agent_workflow_workspace(
         agents = [_to_plain(item) for item in getattr(pod.agents.list(limit=100), "items", []) or []]
         workflows = [_to_plain(item) for item in getattr(pod.workflows.list(limit=100), "items", []) or []]
         schedules = [_to_plain(item) for item in getattr(pod.schedules.list(limit=100), "items", []) or []]
-        installed = {
-            template_id: any((s.get("name") == template_id) for s in schedules)
-            for template_id in TEMPLATES.keys()
-        }
+        existing_names = {(a.get("name") or "") for a in agents} | {(w.get("name") or "") for w in workflows}
+        schedule_names = {(s.get("name") or "") for s in schedules}
+        installed = {}
+        for template_id, tmpl in TEMPLATES.items():
+            res_name = tmpl.get("agent_name") or tmpl.get("workflow_name") or template_id
+            installed[template_id] = (res_name in existing_names) or (template_id in schedule_names)
         return {
             "agents": agents,
             "workflows": workflows,
@@ -1136,13 +1255,17 @@ async def install_agent_workflow_template(
             try:
                 pod.agents.get(agent_name)
             except Exception:
+                toolsets = template.get("toolsets") or ["POD"]
+                connectors = ["gmail"] if req.template_id == "inbox-triage" else None
                 pod.agents.create(CreateAgentRequest.from_dict({
                     "name": agent_name,
                     "description": template["description"],
-                    "instruction": template["description"],
+                    "instruction": template.get("instruction") or template["description"],
+                    "toolsets": toolsets,
+                    "permissions": _pod_grants(write=False, connectors=connectors) if "POD" in toolsets else {"grants": []},
                     "metadata": {"template_id": req.template_id},
                 }))
-        if template["schedule"]:
+        if template.get("schedule"):
             created = _install_schedule(pod, template["schedule"])
             return {"installed": True, "item": created}
         return {"installed": True, "item": {"id": template.get("agent_name"), "manual": True}}
@@ -1167,6 +1290,10 @@ async def create_agent_or_workflow(
                 "name": slug,
                 "description": req.description or "",
                 "instruction": req.instructions or req.description or f"Agent {req.name}",
+                # Give every UI-created agent access to the pod datastore (and web
+                # search) so it can actually read the user's tasks/notes when run.
+                "toolsets": ["POD", "WEB_SEARCH"],
+                "permissions": _pod_grants(write=True),
                 "metadata": {"source": "lifeos_create_new"},
             }))
             target_payload = {"agent_name": slug}
@@ -1236,6 +1363,21 @@ async def resume_workflow_run(
         return _to_plain(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Resume failed: {_sdk_error_message(e)}")
+
+
+@app.post("/api/agents/{name}/run")
+async def run_agent_now(
+    name: str,
+    req: schemas.AssistantQueryRequest,
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    """Run an agent on demand from the UI and return its text response."""
+    prompt = (req.query or "").strip() or "Run your task now using my current pod data and report the result."
+    try:
+        text = await ai.run_agent_text(name, prompt, timeout_s=90)
+        return {"agent": name, "response": text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent run failed: {_sdk_error_message(e)}")
 
 # -- Settings --
 

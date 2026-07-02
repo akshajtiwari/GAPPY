@@ -296,8 +296,14 @@ function switchTab(tabId) {
   
   const panel = document.getElementById(`panel-${tabId}`);
   if (panel) panel.classList.add("active");
-  
-  renderDashboard();
+
+  // Data-driven tabs read from the allItems/allConnections cache — refresh it so
+  // they always reflect the latest pod records instead of stale globals.
+  if (tabId === "life-ops" || tabId === "second-brain") {
+    fetchDashboardData();
+  } else {
+    renderDashboard();
+  }
   lucide.createIcons();
 }
 
@@ -443,7 +449,7 @@ function createTodayTaskRow(t) {
     <label class="custom-checkbox-wrapper" onclick="event.stopPropagation();">
       <input type="checkbox" id="${checkId}" ${isChecked ? 'checked' : ''} onchange="toggleTodayTask(${t.id}, this)">
       <span class="checkmark"></span>
-      <span class="today-task-title" onclick="showItemDetails(${t.id})">${t.title}</span>
+      <span class="today-task-title" onclick="showItemDetails('${t.id}')">${t.title}</span>
     </label>
     <span class="today-task-time">${dueTimeStr}</span>
   `;
@@ -526,7 +532,7 @@ function renderTaskBoard() {
       
       row.innerHTML = `
         <div style="display:flex; align-items:center; gap:0.5rem; flex:1;">
-          <span class="ops-task-title" onclick="showItemDetails(${task.id})" ${textDecorationStyle}>${task.title}</span>
+          <span class="ops-task-title" onclick="showItemDetails('${task.id}')" ${textDecorationStyle}>${task.title}</span>
         </div>
         ${metaHtml}
       `;
@@ -915,7 +921,7 @@ function renderLearningSuite() {
       
       item.innerHTML = `
         <div class="material-title" style="font-weight: 500;">${mat.title}</div>
-        <button class="btn" style="padding:0.3rem 0.6rem; font-size:0.8rem;" onclick="selectMaterialForStudy(${mat.id})">
+        <button class="btn" style="padding:0.3rem 0.6rem; font-size:0.8rem;" onclick="selectMaterialForStudy('${mat.id}')">
           Study
         </button>
       `;
@@ -1404,9 +1410,9 @@ async function startWeeklyReview() {
             <div style="font-size:0.75rem; color:var(--text-secondary);">Due: ${t.due_date ? new Date(t.due_date).toLocaleDateString() : 'no date'}</div>
           </div>
           <div style="display:flex; gap:0.5rem;">
-            <button onclick="snoozeWeeklyItem(${t.id})" class="btn btn-secondary" style="padding:0.25rem 0.5rem; font-size:0.75rem;">Snooze</button>
-            <button onclick="rescheduleWeeklyItem(${t.id})" class="btn btn-secondary" style="padding:0.25rem 0.5rem; font-size:0.75rem;">Reschedule</button>
-            <button onclick="deleteWeeklyItem(${t.id})" class="btn btn-danger" style="padding:0.25rem 0.5rem; font-size:0.75rem;">Delete</button>
+            <button onclick="snoozeWeeklyItem('${t.id}')" class="btn btn-secondary" style="padding:0.25rem 0.5rem; font-size:0.75rem;">Snooze</button>
+            <button onclick="rescheduleWeeklyItem('${t.id}')" class="btn btn-secondary" style="padding:0.25rem 0.5rem; font-size:0.75rem;">Reschedule</button>
+            <button onclick="deleteWeeklyItem('${t.id}')" class="btn btn-danger" style="padding:0.25rem 0.5rem; font-size:0.75rem;">Delete</button>
           </div>
         `;
         attentionList.appendChild(row);
@@ -1525,7 +1531,7 @@ async function showItemDetails(itemId) {
       const otherTitle = c.source_id === item.id ? c.target_title : c.source_title;
       const otherId = c.source_id === item.id ? c.target_id : c.source_id;
       const relation = c.connection_type.replace("_", " ");
-      html += `<li>Mapped to <span class="text-link" onclick="closeModal(); showItemDetails(${otherId})">${otherTitle}</span> (${otherType(c, item.id)}) via <em>${relation}</em></li>`;
+      html += `<li>Mapped to <span class="text-link" onclick="closeModal(); showItemDetails('${otherId}')">${otherTitle}</span> (${otherType(c, item.id)}) via <em>${relation}</em></li>`;
     });
     html += `</ul>`;
   }
@@ -1595,13 +1601,13 @@ async function showItemDetails(itemId) {
       const since = item.metadata_json.waiting_since ? new Date(item.metadata_json.waiting_since).toLocaleDateString() : 'unknown';
       waitingHtml += `
         <p style="font-size:0.85rem; margin-bottom:0.5rem;">Currently waiting on <strong>${name}</strong> (since ${since}).</p>
-        <button onclick="clearWaitingStatus(${item.id})" class="btn btn-secondary" style="padding:0.3rem 0.6rem; font-size:0.8rem; border:none;">Clear Waiting Status</button>
+        <button onclick="clearWaitingStatus('${item.id}')" class="btn btn-secondary" style="padding:0.3rem 0.6rem; font-size:0.8rem; border:none;">Clear Waiting Status</button>
       `;
     } else {
       waitingHtml += `
         <div style="display:flex; gap:0.5rem;">
           <input type="text" id="waiting-person-input" placeholder="Person's name..." style="flex:1; padding:0.3rem 0.5rem; font-size:0.85rem; border-radius:4px; border:1px solid var(--border); background:var(--bg-surface); color:var(--text-primary);">
-          <button onclick="setWaitingStatus(${item.id})" class="btn btn-primary" style="padding:0.3rem 0.6rem; font-size:0.8rem;">Set Waiting</button>
+          <button onclick="setWaitingStatus('${item.id}')" class="btn btn-primary" style="padding:0.3rem 0.6rem; font-size:0.8rem;">Set Waiting</button>
         </div>
       `;
     }
@@ -1892,8 +1898,27 @@ async function renderIntegrationsView() {
 
       let errorHtml = "";
 
+      const settingsManaged = meta.settings_managed === true;
+
       let actionsHtml = "";
-      if (!isConnected) {
+      if (settingsManaged && !isConnected) {
+        actionsHtml = `
+          <button class="btn btn-primary" onclick="switchTab('settings')" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 0.5rem;">
+            <i data-lucide="settings" style="width:14px; height:14px;"></i> Configure in Settings
+          </button>
+        `;
+      } else if (settingsManaged && isConnected) {
+        actionsHtml = `
+          <div style="display: flex; gap: 0.5rem; width: 100%;">
+            <button class="btn btn-secondary" onclick="testIntegration('${item.name}')" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 0.4rem;">
+              <i data-lucide="activity" style="width:14px; height:14px;"></i> Test
+            </button>
+            <button class="btn btn-secondary" onclick="switchTab('settings')" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 0.4rem;">
+              <i data-lucide="settings" style="width:14px; height:14px;"></i> Manage
+            </button>
+          </div>
+        `;
+      } else if (!isConnected) {
         actionsHtml = `
           <button class="btn btn-primary" onclick="connectIntegration('${item.name}')" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 0.5rem;">
             <i data-lucide="plus" style="width:14px; height:14px;"></i> Connect Service
@@ -1921,7 +1946,6 @@ async function renderIntegrationsView() {
             <div>
               <h3 class="integration-title">${displayName}</h3>
               <p style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.15rem; line-height: 1.3;">${desc}</p>
-              ${authTag}
             </div>
           </div>
           <span class="integration-status-badge ${badgeClass}">${statusLabel}</span>
@@ -2188,7 +2212,7 @@ function renderConversationList() {
         <span class="chat-conv-title">${escapeHtml(conv.title)}</span>
         ${tagHtml}
       </div>
-      <button class="chat-conv-delete" title="Delete" onclick="event.stopPropagation(); deleteConversation(${conv.id})">
+      <button class="chat-conv-delete" title="Delete" onclick="event.stopPropagation(); deleteConversation('${conv.id}')">
         <i data-lucide="trash-2" style="width:13px;height:13px;"></i>
       </button>
     `;
@@ -2677,12 +2701,19 @@ function renderAutomationList() {
     const name = item.name || item.id;
     const row = document.createElement("div");
     row.className = "automation-list-item";
+    const runNowBtn = item.kind === "agent"
+      ? `<button class="btn btn-primary" onclick="runAgentNow('${name}')">Run now</button>`
+      : "";
     row.innerHTML = `
       <div>
         <strong>${escapeHtml(automationDisplayName(item))}</strong>
         <p>${escapeHtml(item.description || item.instruction || "")}</p>
       </div>
-      <button class="btn btn-secondary" onclick="loadAutomationRuns('${item.kind}', '${name}')">Run History</button>
+      <div style="display:flex; gap:0.5rem;">
+        ${runNowBtn}
+        <button class="btn btn-secondary" onclick="loadAutomationRuns('${item.kind}', '${name}')">Run History</button>
+      </div>
+      <div id="agent-result-${name}" class="automation-runs"></div>
       <div id="runs-${item.kind}-${name}" class="automation-runs"></div>
     `;
     container.appendChild(row);
@@ -2713,6 +2744,23 @@ function durationText(start, end) {
   const seconds = Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1000));
   if (seconds < 60) return `${seconds}s`;
   return `${Math.round(seconds / 60)}m`;
+}
+
+async function runAgentNow(name) {
+  const box = document.getElementById(`agent-result-${name}`);
+  if (box) {
+    box.style.display = "block";
+    box.innerHTML = `<p class="loading-indicator">Running ${escapeHtml(name)}… this can take up to a minute.</p>`;
+  }
+  try {
+    const res = await apiFetch(`/api/agents/${name}/run`, "POST", { query: "" });
+    if (box) {
+      const text = (res.response || "").trim() || "(no output)";
+      box.innerHTML = `<div class="agent-run-output">${escapeHtml(text).replace(/\n/g, "<br>")}</div>`;
+    }
+  } catch (err) {
+    if (box) box.innerHTML = `<p style="color:var(--danger);">${escapeHtml(err.message)}</p>`;
+  }
 }
 
 async function loadAutomationRuns(kind, name) {

@@ -565,28 +565,19 @@
           </p>
 
           <form id="settings-form">
-            <!-- AI Provider -->
+            <!-- AI Model (managed by the Lemma stack) -->
             <div class="paper-surface" style="margin-bottom: 1.5rem;">
               <h2><i data-lucide="sparkles" style="width:16px;height:16px;display:inline-block;vertical-align:middle;margin-right:6px;"></i> AI Model</h2>
-              <div class="form-group">
-                <label for="set-llm_provider">LLM Provider</label>
-                <select id="set-llm_provider" data-key="llm_provider">
-                  <option value="lemma">Lemma (local agent — no key needed)</option>
-                  <option value="anthropic">Anthropic (Claude)</option>
-                  <option value="openai">OpenAI</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label for="set-llm_model">Model override <span class="setting-hint">(optional)</span></label>
-                <input type="text" id="set-llm_model" data-key="llm_model" placeholder="e.g. claude-opus-4-8">
-              </div>
-              <div class="form-group">
-                <label for="set-anthropic_api_key">Anthropic API Key <span id="flag-anthropic_api_key" class="setting-flag"></span></label>
-                <input type="password" id="set-anthropic_api_key" data-key="anthropic_api_key" data-secret="1" placeholder="sk-ant-...">
-              </div>
-              <div class="form-group">
-                <label for="set-openai_api_key">OpenAI API Key <span id="flag-openai_api_key" class="setting-flag"></span></label>
-                <input type="password" id="set-openai_api_key" data-key="openai_api_key" data-secret="1" placeholder="sk-...">
+              <div class="settings-info-card">
+                <i data-lucide="check-circle" style="width:18px;height:18px;color:var(--accent);flex-shrink:0;margin-top:2px;"></i>
+                <div>
+                  <strong>Powered by your Lemma stack.</strong>
+                  <p style="color: var(--text-secondary); font-size: 0.85rem; margin-top: 0.35rem; line-height: 1.4;">
+                    Every agent, workflow, and chat in LifeOS runs on the model configured in your Lemma stack
+                    (<code>LEMMA_DEFAULT_MODEL_TYPE</code>). There are no per-user API keys to manage here — the
+                    platform handles inference for you.
+                  </p>
+                </div>
               </div>
             </div>
 
