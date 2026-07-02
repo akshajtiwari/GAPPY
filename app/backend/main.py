@@ -2,7 +2,8 @@ import os
 import shutil
 import datetime
 import secrets
-from typing import List, Optional
+import time
+from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +18,116 @@ from . import workflows_service, pod_store
 from . import settings_service, chat as chat_engine
 from .integrations.web_search import web_search, WebSearchError
 from .integrations import email_adapter
+
+
+CHAT_AGENT_NAME = os.getenv("LEMMA_CHAT_AGENT_NAME") or None
+CHAT_POLL_SECONDS = float(os.getenv("LEMMA_CHAT_POLL_SECONDS", "45"))
+
+
+def _to_plain(value: Any) -> Any:
+    """Convert SDK attrs/enums/Unset values into JSON-safe Python values."""
+    if value is None:
+        return None
+    if hasattr(value, "to_dict"):
+        return _to_plain(value.to_dict())
+    if hasattr(value, "value") and not isinstance(value, (str, int, float, bool)):
+        return value.value
+    if value.__class__.__name__ == "Unset":
+        return None
+    if isinstance(value, dict):
+        return {
+            str(k): _to_plain(v)
+            for k, v in value.items()
+            if v.__class__.__name__ != "Unset"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(v) for v in value if v.__class__.__name__ != "Unset"]
+    return value
+
+
+def _sdk_error_message(exc: Exception) -> str:
+    detail = getattr(exc, "message", None) or str(exc)
+    status_code = getattr(exc, "status_code", None)
+    if status_code:
+        return f"Lemma SDK error {status_code}: {detail}"
+    return detail
+
+
+def _conversation_payload(conv: Any) -> Dict[str, Any]:
+    data = _to_plain(conv)
+    return {
+        "id": str(data.get("id")),
+        "title": data.get("title") or "New Chat",
+        "tag": data.get("metadata", {}).get("tag") if isinstance(data.get("metadata"), dict) else None,
+        "metadata_json": data.get("metadata") or {},
+        "created_at": data.get("created_at") or datetime.datetime.utcnow().isoformat(),
+        "updated_at": data.get("updated_at") or data.get("created_at") or datetime.datetime.utcnow().isoformat(),
+    }
+
+
+def _message_payload(msg: Any) -> Dict[str, Any]:
+    data = _to_plain(msg)
+    text = data.get("text")
+    if text is None and data.get("tool_name"):
+        text = f"{data.get('tool_name')}: {data.get('tool_result') or data.get('tool_args') or ''}"
+    return {
+        "id": str(data.get("id")),
+        "conversation_id": str(data.get("conversation_id")),
+        "role": data.get("role") or "assistant",
+        "content": text or "",
+        "tool_calls_json": [],
+        "metadata_json": data.get("metadata") or {},
+        "created_at": data.get("created_at") or datetime.datetime.utcnow().isoformat(),
+    }
+
+
+def _visible_messages(messages: List[Any]) -> List[Dict[str, Any]]:
+    rows = []
+    for msg in messages:
+        data = _to_plain(msg)
+        kind = data.get("kind")
+        role = data.get("role")
+        meta = data.get("metadata") or {}
+        text = data.get("text") or ""
+        if role == "user" or kind == "text" or meta.get("is_final_answer") is True:
+            if text:
+                rows.append(_message_payload(data))
+    return rows
+
+
+def _final_assistant_message(messages: List[Any]) -> Optional[Dict[str, Any]]:
+    visible = _visible_messages(messages)
+    for msg in reversed(visible):
+        if msg["role"] == "assistant" and msg.get("content"):
+            return msg
+    return None
+
+
+def _schedule_request_from_payload(payload: Dict[str, Any]):
+    from lemma_sdk.openapi_client.models.create_schedule_request import CreateScheduleRequest
+    from lemma_sdk.openapi_client.models.create_schedule_request_config import CreateScheduleRequestConfig
+    from lemma_sdk.openapi_client.models.schedule_type import ScheduleType
+
+    schedule_type = (payload.get("schedule_type") or "time").upper()
+    config: Dict[str, Any] = {}
+    if schedule_type == "TIME":
+        config["cron"] = payload.get("cron") or "0 9 * * *"
+    elif schedule_type == "DATASTORE":
+        config["table_name"] = payload.get("table_name") or "notes"
+        config["event"] = payload.get("event") or "insert"
+    cfg = CreateScheduleRequestConfig.from_dict(config)
+    return CreateScheduleRequest(
+        schedule_type=ScheduleType(schedule_type),
+        agent_name=payload.get("agent_name"),
+        workflow_name=payload.get("workflow_name"),
+        name=payload.get("name"),
+        config=cfg,
+    )
+
+
+def _install_schedule(pod, payload: Dict[str, Any]) -> Dict[str, Any]:
+    result = pod.schedules.create(_schedule_request_from_payload(payload))
+    return _to_plain(result)
 
 
 app = FastAPI(title="LifeOS API", version="1.0.0")
@@ -618,13 +729,67 @@ async def get_today_view(
 async def list_integrations(
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    """Live Lemma connector catalog merged with real connection status."""
-    return await connectors_service.list_integrations()
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        status_data = pod.connectors.status()
+        installed = status_data.get("installed") or status_data.get("connectors") or []
+        accounts = status_data.get("accounts") or []
+        if not installed:
+            apps = pod.connectors.apps.list(limit=100)
+            installed = [item.to_dict() for item in getattr(apps, "items", []) or []]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load Lemma integrations: {_sdk_error_message(e)}")
+
+    def norm(value: str) -> str:
+        return (value or "").replace("_", "").replace("-", "").lower()
+
+    connected_by_app = {norm(acc.get("connector_id", "")): acc for acc in accounts}
+    response: List[schemas.UserIntegrationResponse] = []
+    for raw in installed:
+        item = _to_plain(raw)
+        name = item.get("id") or item.get("name") or item.get("connector_id")
+        if not name:
+            continue
+        connected = connected_by_app.get(norm(name))
+        response.append(schemas.UserIntegrationResponse(
+            name=name,
+            is_connected=connected is not None,
+            scopes=item.get("scopes") or [],
+            metadata_json={
+                "display_name": item.get("display_name") or item.get("name") or name,
+                "description": item.get("description") or "",
+                "account": connected or {},
+            },
+            health_status="healthy",
+            error_message=None,
+            last_sync_at=None
+        ))
+    return response
 
 @app.get("/api/integrations/{name}/auth-url")
 async def get_integration_auth_url(
     name: str,
     current_user: models.User = Depends(auth.get_current_user)
+):
+    normalized_name = name.replace("-", "_")
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        req = pod.connectors.connect_request(normalized_name)
+        data = _to_plain(req)
+        auth_url = data.get("authorization_url")
+        if not auth_url:
+            raise ValueError("Lemma did not return an authorization URL for this integration.")
+        return {"auth_url": auth_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lemma connector failed: {_sdk_error_message(e)}")
+
+@app.get("/api/integrations/oauth/callback", response_class=HTMLResponse)
+async def oauth_callback(
+    code: str,
+    state: str,
+    db: AsyncSession = Depends(get_db)
 ):
     try:
         auth_url = await connectors_service.get_connect_url(name)
@@ -637,10 +802,26 @@ async def disconnect_integration(
     name: str,
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    ok = await connectors_service.disconnect(name)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Integration not connected")
-    return {"detail": f"Disconnected {name} successfully."}
+    normalized_name = name.replace("-", "_")
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        norm_app = normalized_name.replace("_", "").replace("-", "").lower()
+        acc_list = pod.connectors.accounts.list()
+        deleted = False
+        for acc in getattr(acc_list, "items", []) or []:
+            acc_data = _to_plain(acc)
+            norm_acc = (acc_data.get("connector_id") or "").replace("_", "").replace("-", "").lower()
+            if norm_app == norm_acc:
+                pod.connectors.accounts.delete(str(acc_data.get("id")))
+                deleted = True
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Integration not connected")
+        return {"detail": f"Disconnected {name} successfully."}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"Failed to disconnect integration: {_sdk_error_message(e)}")
 
 @app.post("/api/integrations/{name}/test")
 async def test_integration_connection(
@@ -728,7 +909,13 @@ async def list_conversations(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    return await crud.list_conversations(db, current_user.id)
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        conversations = pod.conversations.list(agent_name=CHAT_AGENT_NAME, limit=50)
+        return [_conversation_payload(conv) for conv in getattr(conversations, "items", []) or []]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lemma chat failed to list conversations: {_sdk_error_message(e)}")
 
 @app.post("/api/chat/conversations", response_model=schemas.ConversationResponse)
 async def create_conversation(
@@ -736,66 +923,319 @@ async def create_conversation(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    return await crud.create_conversation(db, current_user.id, title=conv_in.title, tag=conv_in.tag)
+    try:
+        from lemma_sdk.openapi_client.models.create_conversation_request import CreateConversationRequest
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        conv = pod.conversations.create(CreateConversationRequest.from_dict({
+            "agent_name": CHAT_AGENT_NAME,
+            "title": conv_in.title or "New Chat",
+            "metadata": {"tag": conv_in.tag} if conv_in.tag else {},
+        }))
+        return _conversation_payload(conv)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lemma chat failed to create a conversation: {_sdk_error_message(e)}")
 
 @app.patch("/api/chat/conversations/{conv_id}", response_model=schemas.ConversationResponse)
 async def update_conversation(
-    conv_id: int,
+    conv_id: str,
     conv_in: schemas.ConversationUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    conv = await crud.update_conversation(db, conv_id, current_user.id,
-                                          title=conv_in.title, tag=conv_in.tag)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return conv
+    try:
+        from lemma_sdk.openapi_client.models.update_conversation_request import UpdateConversationRequest
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        conv = pod.conversations.update(conv_id, UpdateConversationRequest.from_dict({
+            "title": conv_in.title,
+            "metadata": {"tag": conv_in.tag} if conv_in.tag else {},
+        }))
+        return _conversation_payload(conv)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lemma chat failed to update the conversation: {_sdk_error_message(e)}")
 
 @app.delete("/api/chat/conversations/{conv_id}")
 async def delete_conversation(
-    conv_id: int,
+    conv_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    ok = await crud.delete_conversation(db, conv_id, current_user.id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return {"detail": "Conversation deleted"}
+    # The current Python SDK exposes stop/update but not delete for conversations.
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        pod.conversations.stop(conv_id)
+        return {"detail": "Conversation stopped"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lemma chat failed to stop the conversation: {_sdk_error_message(e)}")
 
 @app.get("/api/chat/conversations/{conv_id}/messages", response_model=List[schemas.MessageResponse])
 async def get_conversation_messages(
-    conv_id: int,
+    conv_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    conv = await crud.get_conversation(db, conv_id, current_user.id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return await crud.get_messages(db, conv_id)
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        messages = pod.conversations.messages(conv_id, limit=100)
+        return _visible_messages(getattr(messages, "items", []) or [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lemma chat failed to load messages: {_sdk_error_message(e)}")
 
 @app.post("/api/chat/conversations/{conv_id}/send", response_model=schemas.ChatSendResponse)
 async def send_chat_message(
-    conv_id: int,
+    conv_id: str,
     req: schemas.ChatSendRequest,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    conv = await crud.get_conversation(db, conv_id, current_user.id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Empty message")
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        before = pod.conversations.messages(conv_id, limit=100)
+        before_ids = {str(_to_plain(m).get("id")) for m in getattr(before, "items", []) or []}
+        pod.conversations.send(conv_id, req.message.strip(), metadata={"source": "lifeos_chat"})
 
-    settings = await settings_service.get_resolved_settings(db, current_user.id)
-    user_row, assistant_row, tools_used = await chat_engine.send_message(
-        db, current_user.id, conv, req.message, settings
-    )
-    return schemas.ChatSendResponse(
-        conversation_id=conv.id,
-        user_message=user_row,
-        assistant_message=assistant_row,
-        tools_used=tools_used
-    )
+        deadline = time.monotonic() + CHAT_POLL_SECONDS
+        latest_items: List[Any] = []
+        final_msg: Optional[Dict[str, Any]] = None
+        while time.monotonic() < deadline:
+            msg_list = pod.conversations.messages(conv_id, limit=100)
+            latest_items = getattr(msg_list, "items", []) or []
+            final_msg = _final_assistant_message(latest_items)
+            if final_msg and str(final_msg.get("id")) not in before_ids:
+                break
+            time.sleep(0.75)
+
+        visible = _visible_messages(latest_items)
+        user_msg = None
+        for msg in reversed(visible):
+            if msg["role"] == "user" and msg["content"] == req.message.strip():
+                user_msg = msg
+                break
+        if not user_msg:
+            user_msg = {
+                "id": f"local-user-{int(time.time() * 1000)}",
+                "conversation_id": conv_id,
+                "role": "user",
+                "content": req.message.strip(),
+                "tool_calls_json": [],
+                "metadata_json": {},
+                "created_at": datetime.datetime.utcnow().isoformat(),
+            }
+        if not final_msg:
+            raise HTTPException(status_code=504, detail="Lemma conversation did not produce a final assistant message before the timeout.")
+
+        return schemas.ChatSendResponse(
+            conversation_id=conv_id,
+            user_message=user_msg,
+            assistant_message=final_msg,
+            tools_used=[]
+        )
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"Lemma chat send failed: {_sdk_error_message(e)}")
+
+
+# -- Lemma Agents / Workflows --
+
+TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "daily-briefing": {
+        "name": "Daily Briefing Agent",
+        "type": "agent",
+        "description": "Runs every morning. Summarizes your open tasks, emails, and deadlines into a single brief.",
+        "trigger": "Daily at 8:00 AM",
+        "schedule": {"agent_name": "daily-briefing", "schedule_type": "time", "cron": "0 8 * * *", "name": "daily-briefing"},
+    },
+    "followup-nudger": {
+        "name": "Follow-up Nudger Workflow",
+        "type": "workflow",
+        "description": "Checks tasks marked waiting on someone and sends a nudge after more than 3 days.",
+        "trigger": "Daily at 9:00 AM",
+        "schedule": {"workflow_name": "followup-nudger", "schedule_type": "time", "cron": "0 9 * * *", "name": "followup-nudger"},
+    },
+    "weekly-review": {
+        "name": "Weekly Review Workflow",
+        "type": "workflow",
+        "description": "Every Sunday, summarizes closed tasks, missed deadlines, and next week's attention points.",
+        "trigger": "Weekly Sunday at 10:00 AM",
+        "schedule": {"workflow_name": "weekly-review", "schedule_type": "time", "cron": "0 10 * * 0", "name": "weekly-review"},
+    },
+    "note-to-task": {
+        "name": "Note-to-Task Agent",
+        "type": "agent",
+        "description": "Watches new Second Brain notes and creates tasks when a note sounds actionable.",
+        "trigger": "Notes table insert",
+        "schedule": {"agent_name": "note-to-task", "schedule_type": "datastore", "table_name": "notes", "event": "insert", "name": "note-to-task"},
+    },
+    "study-debrief": {
+        "name": "Study Session Debrief Agent",
+        "type": "agent",
+        "description": "After a study session, asks what you covered, updates strengths, and schedules review.",
+        "trigger": "Manual from Learning",
+        "schedule": None,
+        "agent_name": "study-debrief",
+    },
+}
+
+
+def _slugify_name(value: str) -> str:
+    import re
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+    return slug or "untitled"
+
+
+@app.get("/api/agent-workflows")
+async def list_agent_workflow_workspace(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        agents = [_to_plain(item) for item in getattr(pod.agents.list(limit=100), "items", []) or []]
+        workflows = [_to_plain(item) for item in getattr(pod.workflows.list(limit=100), "items", []) or []]
+        schedules = [_to_plain(item) for item in getattr(pod.schedules.list(limit=100), "items", []) or []]
+        installed = {
+            template_id: any((s.get("name") == template_id) for s in schedules)
+            for template_id in TEMPLATES.keys()
+        }
+        return {
+            "agents": agents,
+            "workflows": workflows,
+            "schedules": schedules,
+            "templates": [
+                {**{k: v for k, v in template.items() if k != "schedule"}, "id": template_id, "installed": installed.get(template_id, False)}
+                for template_id, template in TEMPLATES.items()
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load Lemma agents/workflows: {_sdk_error_message(e)}")
+
+
+@app.post("/api/agent-workflows/templates/install")
+async def install_agent_workflow_template(
+    req: schemas.TemplateInstallRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    template = TEMPLATES.get(req.template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    try:
+        from lemma_sdk.openapi_client.models.create_agent_request import CreateAgentRequest
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        if template["type"] == "agent":
+            agent_name = template.get("agent_name") or template["schedule"]["agent_name"]
+            try:
+                pod.agents.get(agent_name)
+            except Exception:
+                pod.agents.create(CreateAgentRequest.from_dict({
+                    "name": agent_name,
+                    "description": template["description"],
+                    "instruction": template["description"],
+                    "metadata": {"template_id": req.template_id},
+                }))
+        if template["schedule"]:
+            created = _install_schedule(pod, template["schedule"])
+            return {"installed": True, "item": created}
+        return {"installed": True, "item": {"id": template.get("agent_name"), "manual": True}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Template install failed: {_sdk_error_message(e)}")
+
+
+@app.post("/api/agent-workflows/create")
+async def create_agent_or_workflow(
+    req: schemas.AgentWorkflowCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    slug = _slugify_name(req.name)
+    try:
+        from lemma_sdk.openapi_client.models.create_agent_request import CreateAgentRequest
+        from lemma_sdk.openapi_client.models.workflow_create_request import WorkflowCreateRequest
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        if req.type == "agent":
+            created = pod.agents.create(CreateAgentRequest.from_dict({
+                "name": slug,
+                "description": req.description or "",
+                "instruction": req.instructions or req.description or f"Agent {req.name}",
+                "metadata": {"source": "lifeos_create_new"},
+            }))
+            target_payload = {"agent_name": slug}
+        elif req.type == "workflow":
+            description = req.description or "\n".join(req.steps)
+            created = pod.workflows.create(WorkflowCreateRequest.from_dict({
+                "name": slug,
+                "description": description,
+            }))
+            target_payload = {"workflow_name": slug}
+        else:
+            raise HTTPException(status_code=400, detail="Type must be agent or workflow")
+
+        schedule = None
+        if req.trigger_type == "scheduled":
+            schedule = _install_schedule(pod, {
+                **target_payload,
+                "schedule_type": "time",
+                "cron": req.cron or "0 9 * * *",
+                "name": f"{slug}-schedule",
+            })
+        elif req.trigger_type == "datastore":
+            schedule = _install_schedule(pod, {
+                **target_payload,
+                "schedule_type": "datastore",
+                "table_name": req.table_name or "notes",
+                "event": req.event or "insert",
+                "name": f"{slug}-datastore",
+            })
+        return {"created": _to_plain(created), "schedule": schedule, "slug": slug}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"Create failed: {_sdk_error_message(e)}")
+
+
+@app.get("/api/agent-workflows/{kind}/{name}/runs")
+async def get_agent_workflow_runs(
+    kind: str,
+    name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        if kind == "workflow":
+            runs = pod.workflows.runs(name, limit=10)
+            return {"runs": [_to_plain(item) for item in getattr(runs, "items", []) or []]}
+        conversations = pod.conversations.list(agent_name=name, limit=10)
+        return {"runs": [_to_plain(item) for item in getattr(conversations, "items", []) or []]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load run history: {_sdk_error_message(e)}")
+
+
+@app.post("/api/agent-workflows/runs/{run_id}/resume")
+async def resume_workflow_run(
+    run_id: str,
+    req: schemas.WorkflowResumeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    try:
+        from .sdk_client import get_lemma_pod
+        pod = get_lemma_pod()
+        result = pod.workflows.submit_form(run_id, node_id=req.node_id, inputs=req.inputs)
+        return _to_plain(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Resume failed: {_sdk_error_message(e)}")
 
 # -- Settings --
 
@@ -849,5 +1289,3 @@ async def run_web_search(
 
 # Mount static files at root
 app.mount("/", StaticFiles(directory="frontend", html=True), name="static")
-
-

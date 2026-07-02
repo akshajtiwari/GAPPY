@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Union
 from datetime import datetime
 
 class UserCreate(BaseModel):
@@ -142,7 +142,7 @@ class ConversationUpdate(BaseModel):
     tag: Optional[str] = None
 
 class ConversationResponse(BaseModel):
-    id: int
+    id: Union[int, str]
     title: str
     tag: Optional[str] = None
     metadata_json: Dict[str, Any]
@@ -151,8 +151,8 @@ class ConversationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 class MessageResponse(BaseModel):
-    id: int
-    conversation_id: int
+    id: Union[int, str]
+    conversation_id: Union[int, str]
     role: str
     content: Optional[str] = None
     tool_calls_json: List[Dict[str, Any]] = []
@@ -164,10 +164,41 @@ class ChatSendRequest(BaseModel):
     message: str
 
 class ChatSendResponse(BaseModel):
-    conversation_id: int
+    conversation_id: Union[int, str]
     user_message: MessageResponse
     assistant_message: MessageResponse
     tools_used: List[str] = []
+
+
+class AgentWorkflowCreateRequest(BaseModel):
+    type: str
+    name: str
+    description: Optional[str] = ""
+    instructions: Optional[str] = ""
+    steps: List[str] = []
+    trigger_type: str = "manual"
+    cron: Optional[str] = None
+    table_name: Optional[str] = None
+    event: Optional[str] = None
+
+
+class TemplateInstallRequest(BaseModel):
+    template_id: str
+
+
+class ScheduleCreateRequest(BaseModel):
+    agent_name: Optional[str] = None
+    workflow_name: Optional[str] = None
+    schedule_type: str
+    cron: Optional[str] = None
+    table_name: Optional[str] = None
+    event: Optional[str] = None
+    name: Optional[str] = None
+
+
+class WorkflowResumeRequest(BaseModel):
+    node_id: str
+    inputs: Dict[str, Any] = {}
 
 # -- Settings --
 
@@ -205,6 +236,5 @@ class UserIntegrationResponse(BaseModel):
     error_message: Optional[str] = None
     last_sync_at: Optional[datetime] = None
     model_config = ConfigDict(from_attributes=True)
-
 
 

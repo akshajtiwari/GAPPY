@@ -318,6 +318,8 @@ function renderDashboard() {
     renderWorkflowsView();
   } else if (currentTab === "chat") {
     renderChatView();
+  } else if (currentTab === "agents") {
+    renderAgentWorkflowView();
   } else if (currentTab === "settings") {
     renderSettingsView();
   }
@@ -1847,7 +1849,7 @@ async function renderIntegrationsView() {
     container.innerHTML = "";
     
     if (integrations.length === 0) {
-      container.innerHTML = `<p class="empty-state-text">No integrations configured in tool registry.</p>`;
+      container.innerHTML = `<p class="empty-state-text">No integrations configured for this pod yet.</p>`;
       return;
     }
     
@@ -1857,8 +1859,12 @@ async function renderIntegrationsView() {
       card.id = `card-${item.name}`;
 
       const isConnected = item.is_connected;
-      const email = item.account_email || "";
-
+      const health = item.health_status;
+      const meta = item.metadata_json || {};
+      const account = meta.account || {};
+      const email = account.email || account.name || account.id || "Connected Account";
+      const errorMsg = item.error_message;
+      
       // Determine badge class
       let badgeClass = "integration-status-disconnected";
       let statusLabel = "Not Connected";
@@ -1868,13 +1874,12 @@ async function renderIntegrationsView() {
       }
 
       const iconLogo = getBrandLogo(item.name);
-
-      const displayName = item.title || item.name.split("_")
+      
+      const displayName = meta.display_name || item.name.split("_")
         .map(word => word.charAt(0).toUpperCase() + word.slice(1))
         .join(" ");
-      const desc = item.description || "Native Lemma connector.";
-      const authTag = item.auth_scheme ? `<span class="integration-cat-tag">${item.category} · ${item.auth_scheme}</span>` : `<span class="integration-cat-tag">${item.category}</span>`;
-
+      const desc = meta.description || "Available from Lemma integrations.";
+        
       let detailsHtml = "";
       if (isConnected) {
         detailsHtml = `
@@ -2108,6 +2113,22 @@ async function handleAssistantQuerySubmit(e) {
 let chatConversations = [];
 let activeConversationId = null;
 let chatSending = false;
+let automationWorkspace = { templates: [], agents: [], workflows: [], schedules: [] };
+let createFlowState = {
+  step: 1,
+  type: "",
+  name: "",
+  description: "",
+  instructions: "",
+  steps: [""],
+  triggerType: "manual",
+  cronPreset: "daily",
+  customCron: "",
+  tableName: "notes",
+  event: "insert",
+  result: null,
+  error: ""
+};
 
 function escapeHtml(str) {
   return (str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -2264,6 +2285,7 @@ function appendMessageBubble(role, content, meta) {
 
   wrap.innerHTML = `
     <div class="chat-bubble ${role}">
+      <div class="chat-role-label">${role === "user" ? "User" : "Assistant"}</div>
       ${toolsHtml}
       <div class="chat-bubble-text">${formatMarkdown(content)}</div>
       ${memHtml}
@@ -2306,7 +2328,7 @@ async function handleChatSend(e) {
   autoGrowChatInput();
 
   appendMessageBubble("user", text, {});
-  const thinking = appendMessageBubble("assistant", "_Thinking..._", {});
+  const thinking = appendMessageBubble("assistant", "...", {});
   lucide.createIcons();
 
   try {
@@ -2322,7 +2344,7 @@ async function handleChatSend(e) {
     fetchDashboardData();
   } catch (err) {
     thinking.remove();
-    appendMessageBubble("assistant", "⚠️ " + err.message, {});
+    appendMessageBubble("assistant", err.message, {});
   } finally {
     chatSending = false;
     setChatComposerEnabled(true);
@@ -2343,6 +2365,396 @@ async function saveConversationMeta() {
     renderConversationList();
   } catch (err) {
     showToast("Could not update chat: " + err.message, "error");
+  }
+}
+
+// ============================================================
+// AGENTS / WORKFLOWS
+// ============================================================
+function automationCronValue() {
+  if (createFlowState.cronPreset === "weekly") return "0 10 * * 0";
+  if (createFlowState.cronPreset === "custom") return createFlowState.customCron || "0 9 * * *";
+  return "0 9 * * *";
+}
+
+function automationDisplayName(item) {
+  return item.display_name || item.name || item.id || "Untitled";
+}
+
+async function renderAgentWorkflowView() {
+  const templateList = document.getElementById("agent-template-list");
+  const installedList = document.getElementById("agent-workflow-list");
+  if (!templateList || !installedList) return;
+  templateList.innerHTML = `<p class="loading-indicator">Loading templates...</p>`;
+  installedList.innerHTML = `<p class="loading-indicator">Loading agents and workflows...</p>`;
+  try {
+    automationWorkspace = await apiFetch("/api/agent-workflows");
+    renderTemplateCards();
+    renderCreateFlow();
+    renderAutomationList();
+  } catch (err) {
+    templateList.innerHTML = `<p style="color:var(--danger);">Failed to load Lemma automations: ${escapeHtml(err.message)}</p>`;
+    installedList.innerHTML = "";
+  }
+}
+
+function renderTemplateCards() {
+  const container = document.getElementById("agent-template-list");
+  if (!container) return;
+  const templates = automationWorkspace.templates || [];
+  if (templates.length === 0) {
+    container.innerHTML = `<p class="empty-state-text">No templates available.</p>`;
+    return;
+  }
+  container.innerHTML = "";
+  templates.forEach(template => {
+    const card = document.createElement("div");
+    card.className = "automation-card";
+    const statusId = `template-status-${template.id}`;
+    card.innerHTML = `
+      <div class="automation-card-header">
+        <h3>${escapeHtml(template.name)}</h3>
+        <span class="automation-type">${template.type === "agent" ? "Agent" : "Workflow"}</span>
+      </div>
+      <p>${escapeHtml(template.description)}</p>
+      <div class="automation-trigger">${escapeHtml(template.trigger)}</div>
+      <button class="btn ${template.installed ? "btn-secondary" : "btn-primary"}" ${template.installed ? "disabled" : ""} onclick="installAutomationTemplate('${template.id}')">
+        ${template.installed ? "Installed" : "Install"}
+      </button>
+      <div id="${statusId}" class="automation-inline-status"></div>
+    `;
+    container.appendChild(card);
+  });
+}
+
+async function installAutomationTemplate(templateId) {
+  const status = document.getElementById(`template-status-${templateId}`);
+  if (status) status.textContent = "Installing...";
+  try {
+    await apiFetch("/api/agent-workflows/templates/install", "POST", { template_id: templateId });
+    if (status) {
+      status.textContent = "Installed successfully.";
+      status.className = "automation-inline-status success";
+    }
+    await renderAgentWorkflowView();
+  } catch (err) {
+    if (status) {
+      status.textContent = err.message;
+      status.className = "automation-inline-status error";
+    }
+  }
+}
+
+function pickAutomationType(type) {
+  createFlowState.type = type;
+  createFlowState.step = 2;
+  createFlowState.error = "";
+  createFlowState.result = null;
+  renderCreateFlow();
+}
+
+function updateCreateField(key, value) {
+  createFlowState[key] = value;
+  renderCreateFlow();
+}
+
+function updateCreateStep(index, value) {
+  createFlowState.steps[index] = value;
+}
+
+function addWorkflowStep() {
+  createFlowState.steps.push("");
+  renderCreateFlow();
+}
+
+function removeWorkflowStep(index) {
+  createFlowState.steps.splice(index, 1);
+  if (createFlowState.steps.length === 0) createFlowState.steps.push("");
+  renderCreateFlow();
+}
+
+function backCreateFlow() {
+  createFlowState.step = Math.max(1, createFlowState.step - 1);
+  createFlowState.error = "";
+  renderCreateFlow();
+}
+
+function continueCreateFlow() {
+  if (createFlowState.step === 2 && !createFlowState.name.trim()) {
+    createFlowState.error = "Name is required.";
+    renderCreateFlow();
+    return;
+  }
+  createFlowState.step = Math.min(3, createFlowState.step + 1);
+  createFlowState.error = "";
+  renderCreateFlow();
+}
+
+function resetCreateFlow() {
+  createFlowState = {
+    step: 1,
+    type: "",
+    name: "",
+    description: "",
+    instructions: "",
+    steps: [""],
+    triggerType: "manual",
+    cronPreset: "daily",
+    customCron: "",
+    tableName: "notes",
+    event: "insert",
+    result: null,
+    error: ""
+  };
+  renderCreateFlow();
+}
+
+function renderCreateFlow() {
+  const container = document.getElementById("agent-create-flow");
+  if (!container) return;
+  if (createFlowState.step === 1) {
+    container.innerHTML = `
+      <div class="automation-step-title">Step 1: Pick type</div>
+      <div class="automation-type-picker">
+        <button type="button" onclick="pickAutomationType('agent')">
+          <i data-lucide="bot"></i>
+          <strong>Agent</strong>
+          <span>Conversation-driven automation</span>
+        </button>
+        <button type="button" onclick="pickAutomationType('workflow')">
+          <i data-lucide="workflow"></i>
+          <strong>Workflow</strong>
+          <span>Structured multi-step process</span>
+        </button>
+      </div>
+    `;
+    lucide.createIcons();
+    return;
+  }
+
+  if (createFlowState.step === 2) {
+    const isAgent = createFlowState.type === "agent";
+    const cronControls = createFlowState.triggerType === "scheduled" ? `
+      <div class="form-group">
+        <label>Cron preset</label>
+        <select onchange="updateCreateField('cronPreset', this.value)">
+          <option value="daily" ${createFlowState.cronPreset === "daily" ? "selected" : ""}>Daily at 9:00 AM</option>
+          <option value="weekly" ${createFlowState.cronPreset === "weekly" ? "selected" : ""}>Weekly on Sunday</option>
+          <option value="custom" ${createFlowState.cronPreset === "custom" ? "selected" : ""}>Custom</option>
+        </select>
+      </div>
+      ${createFlowState.cronPreset === "custom" ? `
+        <div class="form-group">
+          <label>Custom cron</label>
+          <input type="text" value="${escapeHtml(createFlowState.customCron)}" oninput="updateCreateField('customCron', this.value)" placeholder="0 9 * * *">
+        </div>
+      ` : ""}
+    ` : "";
+    const datastoreControls = createFlowState.triggerType === "datastore" ? `
+      <div class="settings-row">
+        <div class="form-group" style="flex:1;">
+          <label>Table name</label>
+          <input type="text" value="${escapeHtml(createFlowState.tableName)}" oninput="updateCreateField('tableName', this.value)" placeholder="notes">
+        </div>
+        <div class="form-group" style="width:160px;">
+          <label>Event</label>
+          <select onchange="updateCreateField('event', this.value)">
+            <option value="insert" ${createFlowState.event === "insert" ? "selected" : ""}>Insert</option>
+            <option value="update" ${createFlowState.event === "update" ? "selected" : ""}>Update</option>
+            <option value="delete" ${createFlowState.event === "delete" ? "selected" : ""}>Delete</option>
+          </select>
+        </div>
+      </div>
+    ` : "";
+    const workflowSteps = !isAgent ? `
+      <div class="form-group">
+        <label>Steps</label>
+        <div class="automation-steps-list">
+          ${createFlowState.steps.map((step, index) => `
+            <div class="automation-step-row">
+              <input type="text" value="${escapeHtml(step)}" oninput="updateCreateStep(${index}, this.value)" placeholder="Describe step ${index + 1}">
+              <button type="button" class="chat-conv-delete" onclick="removeWorkflowStep(${index})"><i data-lucide="trash-2"></i></button>
+            </div>
+          `).join("")}
+        </div>
+        <button type="button" class="btn btn-secondary" onclick="addWorkflowStep()">Add Step</button>
+      </div>
+    ` : "";
+    container.innerHTML = `
+      <div class="automation-step-title">Step 2: Details</div>
+      <div class="form-group">
+        <label>Name</label>
+        <input type="text" value="${escapeHtml(createFlowState.name)}" oninput="updateCreateField('name', this.value)" placeholder="${isAgent ? "Daily Briefing" : "Weekly Review"}">
+      </div>
+      <div class="form-group">
+        <label>Description</label>
+        <textarea rows="3" oninput="updateCreateField('description', this.value)">${escapeHtml(createFlowState.description)}</textarea>
+      </div>
+      ${isAgent ? `
+        <div class="form-group">
+          <label>Instructions</label>
+          <textarea rows="4" oninput="updateCreateField('instructions', this.value)">${escapeHtml(createFlowState.instructions)}</textarea>
+        </div>
+      ` : workflowSteps}
+      <div class="form-group">
+        <label>Trigger type</label>
+        <select onchange="updateCreateField('triggerType', this.value)">
+          <option value="manual" ${createFlowState.triggerType === "manual" ? "selected" : ""}>Manual</option>
+          <option value="scheduled" ${createFlowState.triggerType === "scheduled" ? "selected" : ""}>Scheduled</option>
+          <option value="datastore" ${createFlowState.triggerType === "datastore" ? "selected" : ""}>On data event</option>
+        </select>
+      </div>
+      ${cronControls}
+      ${datastoreControls}
+      ${createFlowState.error ? `<p class="automation-inline-status error">${escapeHtml(createFlowState.error)}</p>` : ""}
+      <div class="automation-actions">
+        <button type="button" class="btn btn-secondary" onclick="backCreateFlow()">Back</button>
+        <button type="button" class="btn btn-primary" onclick="continueCreateFlow()">Continue</button>
+      </div>
+    `;
+    lucide.createIcons();
+    return;
+  }
+
+  const triggerSummary = createFlowState.triggerType === "scheduled"
+    ? `Scheduled: ${automationCronValue()}`
+    : createFlowState.triggerType === "datastore"
+      ? `Data event: ${createFlowState.tableName} ${createFlowState.event}`
+      : "Manual";
+  container.innerHTML = `
+    <div class="automation-step-title">Step 3: Review & Create</div>
+    <div class="automation-review">
+      <p><strong>Type:</strong> ${createFlowState.type === "agent" ? "Agent" : "Workflow"}</p>
+      <p><strong>Name:</strong> ${escapeHtml(createFlowState.name)}</p>
+      <p><strong>Description:</strong> ${escapeHtml(createFlowState.description || "None")}</p>
+      <p><strong>Trigger:</strong> ${escapeHtml(triggerSummary)}</p>
+    </div>
+    ${createFlowState.result ? `<p class="automation-inline-status success">Created: ${escapeHtml(createFlowState.result.slug || createFlowState.name)}</p>` : ""}
+    ${createFlowState.error ? `<p class="automation-inline-status error">${escapeHtml(createFlowState.error)}</p>` : ""}
+    <div class="automation-actions">
+      <button type="button" class="btn btn-secondary" onclick="backCreateFlow()">Back</button>
+      <button type="button" class="btn btn-primary" onclick="submitCreateFlow()">Create</button>
+      ${createFlowState.result ? `<button type="button" class="btn btn-secondary" onclick="resetCreateFlow()">Create Another</button>` : ""}
+    </div>
+  `;
+}
+
+async function submitCreateFlow() {
+  const payload = {
+    type: createFlowState.type,
+    name: createFlowState.name,
+    description: createFlowState.description,
+    instructions: createFlowState.instructions,
+    steps: createFlowState.steps.filter(Boolean),
+    trigger_type: createFlowState.triggerType,
+    cron: automationCronValue(),
+    table_name: createFlowState.tableName,
+    event: createFlowState.event
+  };
+  try {
+    createFlowState.result = await apiFetch("/api/agent-workflows/create", "POST", payload);
+    createFlowState.error = "";
+    renderCreateFlow();
+    await renderAgentWorkflowView();
+  } catch (err) {
+    createFlowState.error = err.message;
+    renderCreateFlow();
+  }
+}
+
+function renderAutomationList() {
+  const container = document.getElementById("agent-workflow-list");
+  if (!container) return;
+  const agents = (automationWorkspace.agents || []).map(item => ({ ...item, kind: "agent" }));
+  const workflows = (automationWorkspace.workflows || []).map(item => ({ ...item, kind: "workflow" }));
+  const items = [...agents, ...workflows];
+  if (items.length === 0) {
+    container.innerHTML = `<p class="empty-state-text">No agents or workflows found in this pod yet.</p>`;
+    return;
+  }
+  container.innerHTML = "";
+  items.forEach(item => {
+    const name = item.name || item.id;
+    const row = document.createElement("div");
+    row.className = "automation-list-item";
+    row.innerHTML = `
+      <div>
+        <strong>${escapeHtml(automationDisplayName(item))}</strong>
+        <p>${escapeHtml(item.description || item.instruction || "")}</p>
+      </div>
+      <button class="btn btn-secondary" onclick="loadAutomationRuns('${item.kind}', '${name}')">Run History</button>
+      <div id="runs-${item.kind}-${name}" class="automation-runs"></div>
+    `;
+    container.appendChild(row);
+  });
+}
+
+function runStartedAt(run) {
+  return run.started_at || run.created_at || run.updated_at || "";
+}
+
+function runCompletedAt(run) {
+  return run.completed_at || run.finished_at || run.updated_at || "";
+}
+
+function relativeTime(value) {
+  if (!value) return "Unknown";
+  const ms = Date.now() - new Date(value).getTime();
+  const mins = Math.max(0, Math.round(ms / 60000));
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+function durationText(start, end) {
+  if (!start || !end) return "In progress";
+  const seconds = Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.round(seconds / 60)}m`;
+}
+
+async function loadAutomationRuns(kind, name) {
+  const container = document.getElementById(`runs-${kind}-${name}`);
+  if (!container) return;
+  container.innerHTML = `<p class="loading-indicator">Loading run history...</p>`;
+  try {
+    const res = await apiFetch(`/api/agent-workflows/${kind}/${name}/runs`);
+    const runs = (res.runs || []).slice(0, 10);
+    if (runs.length === 0) {
+      container.innerHTML = `<p class="empty-state-text">No runs yet.</p>`;
+      return;
+    }
+    container.innerHTML = runs.map(run => {
+      const status = String(run.status || run.last_run_status || "unknown").toLowerCase();
+      const start = runStartedAt(run);
+      const end = runCompletedAt(run);
+      const wait = run.active_wait || {};
+      const resume = status.includes("waiting") && wait.node_id
+        ? `<button class="btn btn-secondary" onclick="resumeAutomationRun('${run.id}', '${wait.node_id}', '${kind}', '${name}')">Resume</button>`
+        : "";
+      return `
+        <div class="automation-run-row">
+          <span class="run-status run-${status}">${escapeHtml(status)}</span>
+          <span>${escapeHtml(relativeTime(start))}</span>
+          <span>${escapeHtml(durationText(start, end))}</span>
+          ${resume}
+        </div>
+      `;
+    }).join("");
+  } catch (err) {
+    container.innerHTML = `<p style="color:var(--danger);">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function resumeAutomationRun(runId, nodeId, kind, name) {
+  try {
+    await apiFetch(`/api/agent-workflows/runs/${runId}/resume`, "POST", { node_id: nodeId, inputs: {} });
+    showToast("Workflow resumed.", "success");
+    loadAutomationRuns(kind, name);
+  } catch (err) {
+    showToast("Resume failed: " + err.message, "error");
   }
 }
 
@@ -2462,4 +2874,3 @@ function debounce(func, wait) {
     timeout = setTimeout(later, wait);
   };
 }
-

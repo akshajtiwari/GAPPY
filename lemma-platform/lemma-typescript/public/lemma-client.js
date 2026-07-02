@@ -15635,6 +15635,7 @@ var LemmaClient = (() => {
       __publicField(this, "apps");
       __publicField(this, "widgets");
       __publicField(this, "connectors");
+      __publicField(this, "integrations");
       __publicField(this, "resourceAccess");
       __publicField(this, "schedules");
       __publicField(this, "datastore");
@@ -15681,6 +15682,7 @@ var LemmaClient = (() => {
       this.apps = new AppsNamespace(this._generated, this._http, podIdFn);
       this.widgets = new WidgetsNamespace(this._http, podIdFn);
       this.connectors = new ConnectorsNamespace(this._generated, this._http);
+      this.integrations = this.connectors;
       this.resourceAccess = new ResourceAccessNamespace(this._generated, podIdFn);
       this.schedules = new SchedulesNamespace(this._generated, podIdFn);
       this.datastore = new DatastoreNamespace(

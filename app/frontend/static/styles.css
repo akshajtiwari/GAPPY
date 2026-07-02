@@ -1393,6 +1393,14 @@ input[type="text"]:focus, input[type="email"]:focus, input[type="password"]:focu
   line-height: 1.5;
   word-wrap: break-word;
 }
+.chat-role-label {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.25rem;
+  opacity: 0.72;
+}
 .chat-bubble.user {
   background-color: var(--accent);
   color: #fff;
@@ -1485,6 +1493,147 @@ input[type="text"]:focus, input[type="email"]:focus, input[type="password"]:focu
 .settings-checkbox input { width: 16px; height: 16px; }
 
 /* ============================================================
+   AGENTS / WORKFLOWS
+   ============================================================ */
+.automation-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+.automation-card,
+.automation-list-item {
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  box-shadow: var(--shadow-subtle);
+}
+.automation-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.automation-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.automation-card h3 { font-size: 1.05rem; }
+.automation-card p,
+.automation-list-item p {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+.automation-type {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.15rem 0.35rem;
+}
+.automation-trigger {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border);
+  padding-top: 0.65rem;
+}
+.automation-inline-status {
+  min-height: 1rem;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+.automation-inline-status.success { color: var(--success); }
+.automation-inline-status.error { color: var(--danger); }
+.automation-step-title {
+  font-family: var(--font-serif);
+  font-size: 1.15rem;
+  margin-bottom: 1rem;
+}
+.automation-type-picker {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+.automation-type-picker button {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  align-items: flex-start;
+  border: 1px solid var(--border);
+  background: var(--bg-primary);
+  border-radius: 8px;
+  padding: 1rem;
+  cursor: pointer;
+  color: var(--text-primary);
+}
+.automation-type-picker button:hover { border-color: var(--accent); }
+.automation-type-picker i {
+  width: 20px;
+  height: 20px;
+  color: var(--accent);
+}
+.automation-type-picker span {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+.automation-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+.automation-steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.automation-step-row {
+  display: flex;
+  gap: 0.5rem;
+}
+.automation-step-row input { flex: 1; }
+.automation-review {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  background: var(--bg-primary);
+  font-size: 0.9rem;
+}
+.automation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.automation-list-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1rem;
+  align-items: start;
+}
+.automation-runs { grid-column: 1 / -1; }
+.automation-run-row {
+  display: grid;
+  grid-template-columns: 100px 1fr 1fr auto;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.55rem 0;
+  border-top: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.run-status { font-weight: 700; }
+.run-completed { color: var(--success); }
+.run-failed { color: var(--danger); }
+.run-running { color: var(--warning); }
+.run-waiting { color: var(--accent); }
+
+/* ============================================================
    WEB SEARCH PANE
    ============================================================ */
 .web-answer-box {
@@ -1518,6 +1667,12 @@ input[type="text"]:focus, input[type="email"]:focus, input[type="password"]:focu
   .chat-sidebar { width: 100%; max-height: 200px; }
   .chat-main { min-height: 60vh; }
   .settings-row { flex-direction: column; }
+  .automation-grid,
+  .automation-type-picker,
+  .automation-list-item,
+  .automation-run-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Integration / workflow category tag */
